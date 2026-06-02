@@ -1,0 +1,137 @@
+# MoRI-IO ZMQ registration proxy.
+#
+# Every vLLM worker (prefill + decode rank) registers with this ROUTER
+# socket at startup via the proxy_ip / proxy_ping_port keys in the
+# kv_connector_extra_config block (see patch-prefill.yaml /
+# patch-decode.yaml). The proxy is not on the KV data path -- KV blocks
+# travel directly between worker pods over RDMA -- but the registration
+# channel is required by MoRIIOConfig.from_vllm_config in vLLM's
+# moriio_common.py.
+#
+# Pinned to a services node with hostNetwork so the workers (also
+# hostNetwork) reach it on a fixed node IP:10001, set as REPLACE_ZMQ_PROXY_IP
+# in the prefill/decode patches. Tolerates the control-plane NoSchedule
+# taint so it can run on a control-plane services node.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moriio-zmq-proxy-script
+  labels:
+    app: moriio-zmq-proxy
+data:
+  moriio_zmq_registration_proxy.py: |
+    #!/usr/bin/env python3
+    """Tiny ZMQ ROUTER that logs MoRI-IO worker registrations."""
+    import argparse
+    import logging
+    import msgpack
+    import zmq
+
+    log = logging.getLogger(__name__)
+
+    def main() -> None:
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--bind", default="0.0.0.0")
+        ap.add_argument("--port", type=int, default=10001)
+        args = ap.parse_args()
+        ctx = zmq.Context.instance()
+        sock = ctx.socket(zmq.ROUTER)
+        url = f"tcp://{args.bind}:{args.port}"
+        sock.bind(url)
+        log.info("MoRI-IO registration proxy listening on %s (ZMQ ROUTER)", url)
+        while True:
+            try:
+                frames = sock.recv_multipart()
+                if len(frames) < 2:
+                    log.warning("short frame len=%s", len(frames))
+                    continue
+                payload = frames[-1]
+                try:
+                    data = msgpack.unpackb(payload, raw=False)
+                except Exception as exc:
+                    log.warning("msgpack decode failed: %s", exc)
+                    continue
+                if isinstance(data, dict) and data.get("type") == "register":
+                    log.info(
+                        "register role=%s idx=%s req=%s hs=%s notify=%s "
+                        "tp=%s dp=%s mode=%s",
+                        data.get("role"), data.get("index"),
+                        data.get("request_address"),
+                        data.get("handshake_port"), data.get("notify_port"),
+                        data.get("tp_size"), data.get("dp_size"),
+                        data.get("transfer_mode"),
+                    )
+                else:
+                    log.info("recv: %s", data)
+            except KeyboardInterrupt:
+                log.info("shutdown")
+                break
+
+    if __name__ == "__main__":
+        main()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moriio-zmq-proxy
+  labels:
+    app: moriio-zmq-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: moriio-zmq-proxy
+  template:
+    metadata:
+      labels:
+        app: moriio-zmq-proxy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_SERVICES_NODE
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: proxy
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              python3 -c 'import zmq, msgpack' 2>/dev/null \
+                || pip install --no-cache-dir 'pyzmq>=26,<27' 'msgpack>=1.0,<2'
+              exec python3 /opt/proxy/moriio_zmq_registration_proxy.py \
+                --bind 0.0.0.0 --port 10001
+          ports:
+            - name: zmq-reg
+              containerPort: 10001
+              protocol: TCP
+          volumeMounts:
+            - name: script
+              mountPath: /opt/proxy
+              readOnly: true
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: script
+          configMap:
+            name: moriio-zmq-proxy-script
+            defaultMode: 0444
