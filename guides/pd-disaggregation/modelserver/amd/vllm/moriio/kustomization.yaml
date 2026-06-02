@@ -1,0 +1,110 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# MoRI-IO + Wide-EP overlay for the AMD/vLLM P/D disaggregation guide.
+#
+# Targets a single-pod 1P1D DeepSeek-V3 deployment with:
+#   - Tensor-parallel  = 1
+#   - Data-parallel    = 8        (intra-pod, "Wide-EP")
+#   - Expert-parallel  = enabled  (DP * TP = 8)
+#   - vLLM kv_connector = MoRIIOConnector  (RDMA Write of KV blocks
+#     between prefill and decode pods, instead of NIXL).
+#   - Routing sidecar  = llm-d-router with the --moriio-* flags so the
+#     proxy emits MoRI-IO-shaped kv_transfer_params and pins both legs
+#     of every disagg pair to the same DP rank H = blake2s(uuid).
+#
+# Differences vs. the sibling base/ overlay:
+#   1. Model: deepseek-ai/DeepSeek-V3 (~700 GiB MoE) instead of Llama-
+#      3.3-70B-Instruct-FP8-KV (~70 GiB dense).
+#   2. Resources: 8 GPUs/pod, hostNetwork, RDMA device mounts (MoRI-IO
+#      needs direct NIC access for the GPU-direct RDMA Write path).
+#   3. Connector: MoRIIOConnector with kv_role=kv_producer on prefill
+#      and kv_role=kv_consumer on decode (NixlConnector uses kv_both).
+#   4. Sidecar: extra --moriio-write-mode / --moriio-dp-size /
+#      --moriio-tp-size / --moriio-parallel-dispatch flags + POD_IP
+#      env var (downward API).
+#
+# Two image references are declared as unbound placeholders. Operators
+# MUST override both before deploy via `kustomize edit set image` or in
+# a per-cluster overlay; kustomize will fail loudly if either is left
+# unset.
+#
+#   - REPLACE_MODEL_SERVER_IMAGE -> a vLLM ROCm image with MoRI-EP and
+#     MoRI-IO compiled in (see the AMD vLLM image build instructions
+#     under docker/Dockerfile.rocm).
+#
+#   - REPLACE_ROUTING_SIDECAR_IMAGE -> a llm-d-router build that
+#     supports the --moriio-* CLI flags. See the README for the
+#     llm-d-inference-scheduler PR adding these flags.
+#
+# See README.md for the full list of required overrides
+# (model image, sidecar image, optional model-weights mount).
+
+resources:
+  - ../../../../../recipes/modelserver/base/single-host/pd/vllm
+  # In-cluster ZMQ registration proxy that every MoRIIO worker
+  # (prefill + decode rank) calls at startup. Exposed as a ClusterIP
+  # Service named moriio-zmq-proxy on port 10001; referenced from the
+  # prefill/decode patches' kv_connector_extra_config.proxy_ip /
+  # .proxy_ping_port keys.
+  - moriio-zmq-proxy.yaml
+
+namePrefix: pd-disaggregation-rocm-moriio-vllm-
+
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+
+labels:
+  - pairs:
+      llm-d.ai/model: DeepSeek-V3
+      llm-d.ai/guide: pd-disaggregation
+      llm-d.ai/accelerator-variant: gpu
+      llm-d.ai/accelerator-vendor: amd
+      llm-d.ai/kv-connector: moriio
+      inference.networking.k8s.io/engine-type: vllm
+    includeSelectors: true
+    includeTemplates: true
+    fields:
+      - version: v1
+        kind: ServiceAccount
+        path: metadata/labels
+        create: true
+      - group: apps
+        version: v1
+        kind: Deployment
+        path: metadata/labels
+        create: true
+      - group: apps
+        version: v1
+        kind: Deployment
+        path: spec/selector/matchLabels
+        create: true
+      - group: apps
+        version: v1
+        kind: Deployment
+        path: spec/template/metadata/labels
+        create: true
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: metadata/labels
+        create: true
+      - group: monitoring.coreos.com
+        version: v1
+        kind: PodMonitor
+        path: spec/selector/matchLabels
+        create: true
+
+patches:
+  - path: patch-prefill.yaml
+  - path: patch-decode.yaml
+  # patch-sidecar overrides the recipe-default routing-proxy patch
+  # (recipes/.../vllm/patch-sidecar.yaml) with the MoRI-IO sidecar
+  # image and the additional --moriio-* CLI flags. Targets the decode
+  # Deployment by name (only decode runs the routing sidecar in P/D
+  # disagg).
+  - path: patch-sidecar.yaml
+    target:
+      kind: Deployment
+      name: decode

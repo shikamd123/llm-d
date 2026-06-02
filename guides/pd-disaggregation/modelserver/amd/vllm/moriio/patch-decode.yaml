@@ -1,0 +1,170 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decode
+spec:
+  replicas: 1
+  template:
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: modelserver
+          command: ["vllm", "serve"]
+          args:
+            # See patch-prefill.yaml for rationale (HF download via
+            # llm-d-hf-token, or replace with a hostPath/PVC overlay).
+            - "deepseek-ai/DeepSeek-V3"
+            - "--served-model-name=deepseek-ai/DeepSeek-V3"
+            - "--disable-uvicorn-access-log"
+            - "--tensor-parallel-size=1"
+            # Wide-EP: same 8-rank shape as prefill so DP-rank-N
+            # decode can pair with DP-rank-N prefill (the routing
+            # sidecar picks N via blake2s(uuid) for each request).
+            - "--data-parallel-size=8"
+            - "--data-parallel-size-local=8"
+            - "--api-server-count=8"
+            - "--enable-expert-parallel"
+            # Decode is latency-bound (small batches, autoregressive),
+            # so use the MoRI low-latency InterNodeV1LL kernels.
+            - "--all2all-backend=mori_low_latency"
+            # block-size=16 is the smallest value known to be stable
+            # on the current MoRI-IO + AITER-MLA stack.
+            - "--block-size=16"
+            - "--no-enable-prefix-caching"
+            - "--max-model-len=32768"
+            - "--compilation-config"
+            - '{"cudagraph_mode":"NONE"}'
+            - "--kv-transfer-config"
+            # See patch-prefill.yaml -- same in-cluster ZMQ proxy
+            # Service.
+            - '{"kv_connector":"MoRIIOConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"proxy_ip":"moriio-zmq-proxy","proxy_ping_port":"10001","http_port":"8200","handshake_port":"6301","notify_port":"61005"}}'
+            # vLLM listens on 8200; the routing-proxy initContainer
+            # (patch-sidecar.yaml) listens on 8000 and forwards to
+            # 8200. Same convention as the sibling base/ NIXL overlay.
+            - "--port=8200"
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: VLLM_MORIIO_CONNECTOR_READ_MODE
+              value: "0"
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "7200"
+            - name: VLLM_USE_V1
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_MOE
+              value: "1"
+            - name: VLLM_USE_AITER_TRITON_FUSED_MOE
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_PAGED_ATTN
+              value: "0"
+            - name: VLLM_ROCM_USE_AITER_RMSNORM
+              value: "1"
+            - name: VLLM_USE_AITER_TRITON_SILU_MUL
+              value: "0"
+            - name: VLLM_ROCM_USE_AITER_MLA
+              value: "0"
+            - name: VLLM_CUDAGRAPH_MODE
+              value: "NONE"
+            - name: HSA_ENABLE_SDMA
+              value: "1"
+            - name: HSA_FORCE_FINE_GRAIN_PCIE
+              value: "1"
+          ports:
+            - containerPort: 8200
+              name: vllm
+              protocol: TCP
+            - containerPort: 6301
+              name: mori-handshake
+              protocol: TCP
+            - containerPort: 61005
+              name: mori-notify
+              protocol: TCP
+          resources:
+            limits:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+            requests:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK", "SYS_PTRACE", "NET_RAW"]
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: torch-compile-cache
+            - mountPath: /dev/kfd
+              name: dev-kfd
+            - mountPath: /dev/dri
+              name: dev-dri
+            - mountPath: /dev/infiniband
+              name: dev-ib
+            - mountPath: /sys/class/infiniband
+              name: sys-class-ib
+              readOnly: true
+            - mountPath: /sys/class/net
+              name: sys-class-net
+              readOnly: true
+          # See patch-prefill.yaml for the named-port probe override
+          # rationale. Decode probes vLLM directly on 8200; the
+          # routing-sidecar initContainer fronts 8000 and forwards
+          # to 8200.
+          startupProbe:
+            httpGet: { path: /v1/models, port: 8200 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 240
+          livenessProbe:
+            httpGet: { path: /health, port: 8200 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /v1/models, port: 8200 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: torch-compile-cache
+          emptyDir: {}
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+        - name: dev-ib
+          hostPath:
+            path: /dev/infiniband
+        - name: sys-class-ib
+          hostPath:
+            path: /sys/class/infiniband
+        - name: sys-class-net
+          hostPath:
+            path: /sys/class/net
