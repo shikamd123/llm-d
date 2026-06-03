@@ -1,0 +1,13 @@
+# Switch the model-server Deployments from RollingUpdate to Recreate.
+# Each is replicas=1 + hostNetwork + a pinned single-node nodeSelector, so
+# a second replica can never schedule (host ports + GPUs are taken) and
+# RollingUpdate wedges the rollout. rollingUpdate: null clears the block
+# the apiserver defaults in, which Recreate rejects.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PLACEHOLDER  # overridden per-target in kustomization.yaml
+spec:
+  strategy:
+    type: Recreate
+    rollingUpdate: null

@@ -1,0 +1,69 @@
+# Cross-pod RDMA/NCCL/MoRI/UCX fabric env, applied to all 4 model-server
+# pods. With DP=16 spanning two pods, vLLM forms a 16-rank
+# torch.distributed world over RoCEv2; without this block the NCCL
+# watchdog fires before the ~25 min DSV3 cold start finishes (the "[Rank
+# N] HIP error: no error" tear-down), HCA selection is wrong, and the
+# MoRI-EP shmem / UCX KV handshake never bootstraps.
+#
+# The mlx5 device lists and GID/TC/SL values are fabric-specific; tune
+# them for your RoCE topology (here mlx5_1 and mlx5_6 are mgmt/storage and
+# are excluded).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: PLACEHOLDER  # overridden per-target in kustomization.yaml
+spec:
+  template:
+    spec:
+      containers:
+        - name: modelserver
+          env:
+            # NCCL / RCCL multi-pod DP rendezvous over RoCEv2.
+            - { name: GLOO_SOCKET_IFNAME,             value: "eth0" }
+            - { name: NCCL_SOCKET_IFNAME,             value: "eth0" }
+            - { name: NCCL_IB_HCA,                    value: "^mlx5_1,mlx5_6" }
+            - { name: NCCL_IB_GID_INDEX,              value: "1" }
+            - { name: NCCL_NET_GDR_LEVEL,             value: "3" }
+            - { name: NCCL_CROSS_NIC,                 value: "1" }
+            # Extend the watchdog heartbeat to cover the long cold start.
+            - { name: NCCL_HEARTBEAT_TIMEOUT_SEC,     value: "1800" }
+            - { name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC, value: "1800" }
+            # MoRI-EP / MoRI-IO fabric: expert-parallel all2all + KV WRITE.
+            - { name: MORI_GPU_ARCHS,                 value: "gfx942" }
+            - { name: MORI_RDMA_DEVICES,              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9" }
+            - { name: MORI_SOCKET_IFNAME,             value: "eth0" }
+            - { name: MORI_IB_GID_INDEX,              value: "1" }
+            - { name: MORI_NUM_QP_PER_PE,             value: "4" }
+            # RoCE QoS: DSCP from MORI_RDMA_TC, eth_prio from MORI_RDMA_SL.
+            - { name: MORI_RDMA_TC,                   value: "41" }
+            - { name: MORI_RDMA_SL,                   value: "0" }
+            # MoRI shmem heap per rank (16 GiB); the 4 GiB default fragments
+            # and exhausts during MoRI-EP bootstrap at DP=16 EP=16 on DSV3.
+            - { name: MORI_SHMEM_HEAP_SIZE,           value: "17179869184" }
+            # expandable_segments avoids reserved-but-unallocated HIP heap
+            # fragmentation; set both keys for new and older PyTorch.
+            - { name: PYTORCH_ALLOC_CONF,             value: "expandable_segments:True" }
+            - { name: PYTORCH_HIP_ALLOC_CONF,         value: "expandable_segments:True" }
+            - { name: VLLM_MORIIO_QP_PER_TRANSFER,    value: "4" }
+            - { name: VLLM_MORIIO_NUM_WORKERS,        value: "4" }
+            - { name: VLLM_MORIIO_TRANSFER_TIMEOUT_S, value: "600" }
+            - { name: VLLM_MORIIO_DEFERRED_TIMEOUT_S, value: "1800" }
+            # Child engines wait this long for the master DP coordinator
+            # during startup; first cold compile can exceed the 30 min
+            # default and trips the coordinator's HELLO guard.
+            - { name: VLLM_HANDSHAKE_TIMEOUT_MINS,    value: "120" }
+            # UCX transport for the per-request KV handshake.
+            - { name: UCX_NET_DEVICES,                value: "mlx5_0:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_7:1,mlx5_8:1,mlx5_9:1" }
+            - { name: UCX_IB_GID_INDEX,               value: "1" }
+            - { name: UCX_TLS,                        value: "rc,self,shm,tcp" }
+            - { name: UCX_IB_GPU_DIRECT_RDMA,         value: "y" }
+            # ROCm / HIP runtime tweaks.
+            - { name: HSA_NO_SCRATCH_RECLAIM,         value: "1" }
+            - { name: GPU_MAX_HW_QUEUES,              value: "2" }
+            - { name: HIP_FORCE_DEV_KERNARG,          value: "1" }
+            # Engine-level timeouts for the long DSV3 + DP=16 cold start.
+            - { name: VLLM_ENGINE_READY_TIMEOUT_S,        value: "10800" }
+            - { name: VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS, value: "1800" }
+            - { name: VLLM_ENGINE_ITERATION_TIMEOUT_S,    value: "1800" }
+            - { name: NCCL_DEBUG,                     value: INFO }
+            - { name: NCCL_DEBUG_SUBSYS,              value: INIT,NET,GRAPH }

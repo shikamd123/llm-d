@@ -1,0 +1,96 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Target the llm-d namespace explicitly; otherwise `kubectl apply -k`
+# defaults to the `default` namespace and creates a second, idle copy.
+namespace: llm-d
+
+# 2P2D Wide-EP-16 overlay: DeepSeek-V3 with global DP=EP=16, TP=1 across
+# 2 prefill + 2 decode pods (8 local DP ranks each). Additive to the 1P1D
+# DP=EP=8 base in ../moriio: it inherits that base, patches the master
+# Deployments to DP=16 / dp_local=8 with the cross-pod DP coordinator, and
+# adds the prefill/decode child Deployments for the second 8-rank pod.
+#
+# The sidecar emits remote_hosts + remote_dp_size_local on both legs so
+# vLLM resolves the per-rank pod as pod_idx = global_dp_rank // dp_local
+# and host = remote_hosts[pod_idx].
+#
+# Replace every REPLACE_* placeholder (node names, pod IPs, images) before
+# deploying. See README.md.
+
+resources:
+  # The MoRI-IO zmq registration proxy is provided by the inherited base
+  # overlay and shared by both legs (reached via REPLACE_ZMQ_PROXY_IP).
+  - ../moriio
+  - prefill-child.yaml
+  - decode-child.yaml
+  # sitecustomize shim that disables torch._inductor autotune_pointwise
+  # before vLLM imports torch._inductor. The equivalent env var is not
+  # bound in this PyTorch build, so the Python config flag is the only
+  # lever; see inductor-shim-configmap.yaml.
+  - inductor-shim-configmap.yaml
+
+# Supply the MoRI-IO WRITE-mode model-server and Wide-EP multi-pod sidecar
+# images. Re-emitted here (not only in the base) because kustomize image
+# substitution does not cascade onto the child Deployments added above.
+images:
+  - name: REPLACE_MODEL_SERVER_IMAGE
+    newName: REPLACE_MODEL_SERVER_IMAGE_NAME
+    newTag: REPLACE_MODEL_SERVER_IMAGE_TAG
+  - name: REPLACE_ROUTING_SIDECAR_IMAGE
+    newName: REPLACE_ROUTING_SIDECAR_IMAGE_NAME
+    newTag: REPLACE_ROUTING_SIDECAR_IMAGE_TAG
+
+patches:
+  # Master Deployments: widen the inherited DP=8 to DP=16 / dp_local=8 and
+  # add the master-side cross-pod DP coordinator args.
+  - path: patch-prefill-master.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-prefill
+  - path: patch-decode-master.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode
+  # Decode sidecar: add --moriio-remote-hosts / --moriio-dp-size-local and
+  # widen --moriio-dp-size for the multi-pod fan-out.
+  - path: patch-sidecar-2p2d.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode
+  # NCCL/RCCL/MoRI fabric env on all 4 model-server pods so the cross-pod
+  # DP=16 process group can form.
+  - path: patch-nccl-env.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-prefill
+  - path: patch-nccl-env.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-prefill-child
+  - path: patch-nccl-env.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode
+  - path: patch-nccl-env.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode-child
+  # Recreate strategy on all 4 model-server pods: replicas=1 + hostNetwork
+  # + a pinned nodeSelector make the default RollingUpdate wedge.
+  - path: patch-strategy-recreate.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-prefill
+  - path: patch-strategy-recreate.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-prefill-child
+  - path: patch-strategy-recreate.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode
+  - path: patch-strategy-recreate.yaml
+    target:
+      kind: Deployment
+      name: pd-disaggregation-rocm-moriio-vllm-decode-child
