@@ -1,0 +1,103 @@
+# Prefill MASTER pod: pin to its node and widen the inherited DP=8 to the
+# Wide-EP-16 shape (DP=16, dp_local=8). The master hosts the cross-pod DP
+# coordinator on its own POD_IP. A strategic-merge of `args` replaces the
+# whole list, so the parent overlay's args are re-emitted here.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prefill
+spec:
+  replicas: 1
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_PREFILL_MASTER_NODE
+      containers:
+        - name: modelserver
+          command: ["vllm", "serve"]
+          args:
+            - "/models/DeepSeek-V3"
+            - "--served-model-name=deepseek-ai/DeepSeek-V3"
+            - "--disable-uvicorn-access-log"
+            # Prefill has no routing-proxy sidecar, so vLLM owns the ingress
+            # port directly. Must be 8000 to match the EPP-injected
+            # x-prefiller-host-port and the MoRI-IO http_port. Do not put a
+            # proxy in front of the prefill leg: it breaks the WRITE-mode KV
+            # handshake under load.
+            - "--port=8000"
+            - "--tensor-parallel-size=1"
+            - "--gpu-memory-utilization=0.80"
+            # Wide-EP-16 master: 16 global DP ranks, 8 local (ranks 0..7);
+            # the child pod owns ranks 8..15.
+            - "--data-parallel-size=16"
+            - "--data-parallel-size-local=8"
+            # Master DP coordinator address. With hostNetwork=true POD_IP is
+            # the node mgmt IP; child pods join this address+port.
+            - "--data-parallel-address=$(POD_IP)"
+            - "--data-parallel-rpc-port=13345"
+            - "--api-server-count=8"
+            - "--enable-expert-parallel"
+            - "--all2all-backend=mori_high_throughput"
+            - "--block-size=1"
+            - "--no-enable-prefix-caching"
+            - "--max-model-len=32768"
+            # DSV3 + EP=16 cold start over 2 pods can take ~25 min to reach
+            # the collective barrier; raise the default process-group timeout.
+            - "--distributed-timeout-seconds=7200"
+            - "--compilation-config"
+            # PIECEWISE captures-and-replays so per-call Inductor autotune is
+            # skipped; NONE leaves max-autotune live and deadlocks profile_run.
+            - '{"cudagraph_mode":"PIECEWISE"}'
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MoRIIOConnector","kv_role":"kv_producer","kv_connector_extra_config":{"proxy_ip":"REPLACE_ZMQ_PROXY_IP","proxy_ping_port":"10001","http_port":"8000","handshake_port":"6301","notify_port":"61005"}}'
+          # Strategic merge overrides parent env vars by name.
+          env:
+            - { name: VLLM_ROLE,                       value: "prefill" }
+            - { name: VLLM_ROCM_USE_AITER_MLA,         value: "1" }
+            - { name: TORCHINDUCTOR_BENCHMARK_KERNEL,  value: "0" }
+            # Prepend the shim dir so sitecustomize runs before vLLM imports
+            # torch._inductor (the autotune env var is not bound in this build).
+            - { name: PYTHONPATH,                      value: "/etc/python-shim" }
+          volumeMounts:
+            - { mountPath: /models/DeepSeek-V3, name: dsv3-weights, readOnly: true }
+            - { mountPath: /opt/vllm_cache,    name: vllm-cache-host }
+            - { mountPath: /etc/python-shim,   name: inductor-shim, readOnly: true }
+          startupProbe:
+            httpGet: { path: /v1/models, port: 8000 }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 240
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /v1/models, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+      # Seed /opt/vllm_cache from the image-baked warm cache; idempotent.
+      initContainers:
+        - name: vllm-cache-seed
+          image: REPLACE_MODEL_SERVER_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/entrypoint-seed-cache.sh"]
+          env:
+            - { name: VLLM_ROLE, value: "prefill" }
+          volumeMounts:
+            - { mountPath: /opt/vllm_cache, name: vllm-cache-host }
+      volumes:
+        - name: dsv3-weights
+          hostPath:
+            path: REPLACE_MODEL_HOST_PATH
+            type: Directory
+        - name: vllm-cache-host
+          hostPath:
+            path: REPLACE_CACHE_HOST_PATH/prefill
+            type: DirectoryOrCreate
+        - name: inductor-shim
+          configMap:
+            name: inductor-autotune-shim
+            defaultMode: 0444

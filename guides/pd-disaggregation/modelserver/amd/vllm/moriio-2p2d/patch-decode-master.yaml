@@ -1,0 +1,77 @@
+# Decode MASTER pod: pin to its node and widen the inherited DP=8 to the
+# Wide-EP-16 shape (DP=16, dp_local=8). Mirrors the prefill master's
+# DP-coordinator wiring on the decode side.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decode
+spec:
+  replicas: 1
+  template:
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_DECODE_MASTER_NODE
+      containers:
+        - name: modelserver
+          command: ["vllm", "serve"]
+          args:
+            - "/models/DeepSeek-V3"
+            - "--served-model-name=deepseek-ai/DeepSeek-V3"
+            - "--disable-uvicorn-access-log"
+            # The routing-proxy sidecar owns ingress port 8000 and forwards
+            # to vLLM at 8200; vLLM must move off 8000 to avoid EADDRINUSE on
+            # this host-network pod.
+            - "--port=8200"
+            - "--tensor-parallel-size=1"
+            - "--gpu-memory-utilization=0.80"
+            - "--data-parallel-size=16"
+            - "--data-parallel-size-local=8"
+            - "--data-parallel-address=$(POD_IP)"
+            - "--data-parallel-rpc-port=13346"
+            - "--api-server-count=8"
+            - "--enable-expert-parallel"
+            # Decode is latency-bound (single-token steps), so use the MoRI
+            # low-latency InterNodeV1LL kernel. Prefill stays high-throughput.
+            - "--all2all-backend=mori_low_latency"
+            - "--block-size=1"
+            - "--no-enable-prefix-caching"
+            - "--max-model-len=32768"
+            - "--distributed-timeout-seconds=7200"
+            - "--compilation-config"
+            - '{"cudagraph_mode":"PIECEWISE"}'
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MoRIIOConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"proxy_ip":"REPLACE_ZMQ_PROXY_IP","proxy_ping_port":"10001","http_port":"8000","handshake_port":"6301","notify_port":"61005"}}'
+          # Strategic merge overrides parent env vars by name.
+          env:
+            - { name: VLLM_ROLE,                       value: "decode" }
+            - { name: VLLM_ROCM_USE_AITER_MLA,         value: "1" }
+            - { name: TORCHINDUCTOR_BENCHMARK_KERNEL,  value: "0" }
+            - { name: PYTHONPATH,                      value: "/etc/python-shim" }
+          volumeMounts:
+            - { mountPath: /models/DeepSeek-V3, name: dsv3-weights, readOnly: true }
+            - { mountPath: /opt/vllm_cache,    name: vllm-cache-host }
+            - { mountPath: /etc/python-shim,   name: inductor-shim, readOnly: true }
+      # Seed the warm cache; runs alongside the routing-proxy initContainer
+      # added by patch-sidecar-2p2d.yaml (merged by name).
+      initContainers:
+        - name: vllm-cache-seed
+          image: REPLACE_MODEL_SERVER_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/entrypoint-seed-cache.sh"]
+          env:
+            - { name: VLLM_ROLE, value: "decode" }
+          volumeMounts:
+            - { mountPath: /opt/vllm_cache, name: vllm-cache-host }
+      volumes:
+        - name: dsv3-weights
+          hostPath:
+            path: REPLACE_MODEL_HOST_PATH
+            type: Directory
+        - name: vllm-cache-host
+          hostPath:
+            path: REPLACE_CACHE_HOST_PATH/decode
+            type: DirectoryOrCreate
+        - name: inductor-shim
+          configMap:
+            name: inductor-autotune-shim
+            defaultMode: 0444

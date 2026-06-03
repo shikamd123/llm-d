@@ -1,0 +1,48 @@
+# Shim that disables torch._inductor.config.triton.autotune_pointwise via a
+# sitecustomize.py loaded from a ConfigMap-backed dir prepended to
+# PYTHONPATH. This PyTorch build exposes the config flag but does not bind
+# it to a TORCHINDUCTOR_* env var, so the env-var lever is a silent no-op
+# and the Python flag is the only way to set it.
+#
+# Without it, the first dummy forward stalls in the Inductor per-config
+# benchmark loop timing a fused RMS-norm reduction kernel that invokes a
+# cross-rank collective; ranks desync on that collective and the DP=16
+# world hangs. Disabling pointwise autotune short-circuits the sweep to a
+# single default config. sitecustomize runs before vLLM imports
+# torch._inductor, so the flag is set before any cache initializes.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inductor-autotune-shim
+  namespace: llm-d
+  labels:
+    llm-d.ai/component: inductor-shim
+data:
+  sitecustomize.py: |
+    # Disable torch._inductor pointwise autotune before vLLM imports
+    # torch._inductor. Silent if torch._inductor is not present.
+    try:
+        import torch._inductor.config as _ic
+        try:
+            _ic.triton.autotune_pointwise = False
+        except Exception:
+            pass
+        try:
+            _ic.benchmark_kernel = False
+        except Exception:
+            pass
+        try:
+            _ic.autotune_local_cache = True
+        except Exception:
+            pass
+        import sys
+        print(
+            "[inductor-shim] cfg.triton.autotune_pointwise = "
+            + repr(getattr(_ic.triton, "autotune_pointwise", "<missing>")),
+            file=sys.stderr, flush=True,
+        )
+    except ImportError:
+        pass
+    except Exception as _e:
+        import sys
+        print("[inductor-shim] failed: " + repr(_e), file=sys.stderr, flush=True)

@@ -1,0 +1,55 @@
+# Decode-side routing-sidecar patch for the 2P2D Wide-EP-16 topology.
+#
+# A strategic-merge of `args` replaces the whole list, so the parent
+# overlay's flags are re-emitted verbatim plus the multi-pod flags:
+#   --moriio-dp-size=16       global DP world (was 8 in 1P1D)
+#   --moriio-dp-size-local=8  per-pod DP; consumer maps pod_idx = rank/8
+#   --moriio-remote-hosts     ordered prefill pod IPs (master, child)
+#   --moriio-decode-hosts     ordered decode pod IPs (master, child); used
+#                             on the prefill leg so KV is written to the
+#                             right decode pod. Omitting it collapses the
+#                             prefill leg to one host and cross-pod writes
+#                             hang.
+#
+# The image override in kustomization.yaml supplies a sidecar build that
+# understands these flags. Replace the REPLACE_*_IP placeholders with the
+# pod IPs (= node mgmt IPs under hostNetwork=true) before deploying.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: decode
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: routing-proxy
+          image: REPLACE_ROUTING_SIDECAR_IMAGE
+          imagePullPolicy: IfNotPresent
+          args:
+            - --port=8000
+            - --vllm-port=8200
+            - --connector=nixlv2
+            - --zap-log-level=1
+            - --secure-proxy=false
+            - --moriio-write-mode
+            - --moriio-dp-size=16
+            - --moriio-dp-size-local=8
+            - --moriio-tp-size=1
+            - --moriio-remote-hosts=REPLACE_PREFILL_MASTER_IP,REPLACE_PREFILL_CHILD_IP
+            - --moriio-decode-hosts=REPLACE_DECODE_MASTER_IP,REPLACE_DECODE_CHILD_IP
+            - --moriio-parallel-dispatch
+            - --moriio-local-pod-ip=$(POD_IP)
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 8000
+              name: sidecar
+              protocol: TCP
+          resources: {}
+          restartPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
