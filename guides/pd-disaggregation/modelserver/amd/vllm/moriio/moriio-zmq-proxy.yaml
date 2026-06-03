@@ -109,6 +109,13 @@ spec:
                 || pip install --no-cache-dir 'pyzmq>=26,<27' 'msgpack>=1.0,<2'
               exec python3 /opt/proxy/moriio_zmq_registration_proxy.py \
                 --bind 0.0.0.0 --port 10001
+          # The container runs as a non-root UID without a homedir; pip
+          # otherwise resolves HOME to "/" and fails to create /.local
+          # for the implicit --user install. Point HOME at /tmp so the
+          # pyzmq + msgpack install lands somewhere writable.
+          env:
+            - name: HOME
+              value: /tmp
           ports:
             - name: zmq-reg
               containerPort: 10001

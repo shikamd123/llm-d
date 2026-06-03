@@ -31,6 +31,14 @@ spec:
             # block-size=16 is the smallest value known to be stable
             # on the current MoRI-IO + AITER-MLA stack.
             - "--block-size=16"
+            # Leave headroom for MoRI-IO RDMA + MoRI-EP all2all
+            # buffers. The vLLM default of 0.9 is too aggressive on
+            # MI300X for DeepSeek-V3 with EP=8.
+            - "--gpu-memory-utilization=0.75"
+            # Pin the KV cache to a predictable 20 GB rather than
+            # letting vLLM auto-size from gpu-memory-utilization.
+            # Pairs with the lower utilization above.
+            - "--kv-cache-memory-bytes=20000000000"
             - "--no-enable-prefix-caching"
             - "--max-model-len=32768"
             - "--compilation-config"
@@ -72,6 +80,11 @@ spec:
               value: "1"
             - name: VLLM_ROCM_USE_AITER_MLA
               value: "0"
+            # MoRI shmem heap size (16 GiB). Read by the MoRI library
+            # at init for the EP all2all path. The library default is
+            # too small for DeepSeek-V3 with DP=EP=8.
+            - name: MORI_SHMEM_HEAP_SIZE
+              value: "17179869184"
             - name: HSA_ENABLE_SDMA
               value: "1"
             - name: HSA_FORCE_FINE_GRAIN_PCIE
