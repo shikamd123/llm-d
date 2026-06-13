@@ -1,79 +1,130 @@
-# 2P2D Wide-EP-16 overlay (DeepSeek-V3, MoRI-IO)
+# 2P2D Wide-EP-16 MoRI-IO Guide (DORMANT)
 
-Overlay for **2 prefill + 2 decode** pods running DeepSeek-V3 with global
-DP=EP=16, TP=1 on AMD MI300X. It is additive to the 1P1D DP=EP=8 base in
-`../moriio`: it inherits that base, patches the master Deployments to the
-DP=16 / dp_local=8 shape, and adds the prefill/decode child Deployments
-for the second 8-rank pod on each side.
+> **Status: DORMANT - Not Yet Enabled**
+>
+> This guide requires the MoRI-IO WRITE-mode feature in the llm-d-router sidecar,
+> which is currently **dormant** (disabled by default). Deploying with these
+> configurations will fail until the feature is enabled in a future Release Candidate.
 
-## Topology
+## Overview
 
-| Role                       | Global DP ranks | OAI front-end                   |
-|----------------------------|-----------------|---------------------------------|
-| services + zmq-proxy + EPP | —               | —                               |
-| prefill-master             | 0..7            | yes (8 procs)                   |
-| prefill-child              | 8..15           | no (`--headless`)               |
-| decode-master              | 0..7            | yes (8 procs) + routing-sidecar |
-| decode-child               | 8..15           | no (`--headless`)               |
+This guide deploys **2 prefill + 2 decode** pods running DeepSeek-V3 with:
+- Global DP=EP=16, TP=1
+- AMD MI300X GPUs (8 per pod)
+- MoRI-IO RDMA Write for KV cache transfer
 
-Each model-server pod has 8 GPUs, `hostNetwork: true` (so pod IP = node
-mgmt IP), and mounts DSV3 weights + a per-role vLLM cache from node-local
-host paths (`REPLACE_MODEL_HOST_PATH` / `REPLACE_CACHE_HOST_PATH`).
+## Why is this feature dormant?
 
-## What's new vs. 1P1D
+The deployment guide has been merged to:
+1. Allow early review and feedback
+2. Enable incremental CI test development
+3. Validate the configuration structure
 
-1. **Cross-pod DP**: the master pods set `--data-parallel-size=16
-   --data-parallel-size-local=8 --data-parallel-address=$(POD_IP)
-   --data-parallel-rpc-port=...`; the child pods add
-   `--data-parallel-start-rank=8 --headless`.
-2. **Sidecar Wide-EP fan-out flags** on the decode sidecar:
-   `--moriio-dp-size=16`, `--moriio-dp-size-local=8`,
-   `--moriio-remote-hosts=<prefill master,child>`,
-   `--moriio-decode-hosts=<decode master,child>`.
-3. The vLLM MoRI-IO connector consumes `remote_hosts` /
-   `remote_dp_size_local` from `kv_transfer_params` and resolves
-   `pod_idx = global_dp_rank // dp_size_local` per handshake. When those
-   keys are absent (the 1P1D path) it falls through to the single-host
-   branch unchanged.
+However, the **sidecar feature flag** (`MoRIIOFeatureEnabled`) is set to `false`.
+The feature will be enabled in a future Release Candidate (RC) after:
+- [ ] Sidecar MoRI-IO WRITE-mode is validated
+- [ ] End-to-end CI tests are added
+- [ ] Production deployment validation is complete
+- [ ] LeaderWorkerSet (LWS) deployment guides are finalized
 
-## Placeholders to replace before deploy
+## How to enable (FUTURE)
 
-Replace every `REPLACE_*` token (in the YAML files) with your values:
+Once the sidecar feature is ready, the constant in
+`llm-d-inference-scheduler/pkg/sidecar/proxy/options.go` will be changed:
 
-| Placeholder                       | Value                                            |
-|-----------------------------------|--------------------------------------------------|
-| `REPLACE_MODEL_SERVER_IMAGE_NAME` / `_TAG` | MoRI-IO WRITE-mode model-server image   |
-| `REPLACE_ROUTING_SIDECAR_IMAGE_NAME` / `_TAG` | Wide-EP multi-pod routing sidecar    |
-| `REPLACE_SERVICES_NODE`           | hostname of the services / zmq-proxy node        |
-| `REPLACE_PREFILL_MASTER_NODE` / `_CHILD_NODE` | prefill node hostnames               |
-| `REPLACE_DECODE_MASTER_NODE` / `_CHILD_NODE`  | decode node hostnames                |
-| `REPLACE_ZMQ_PROXY_IP`            | services-node IP serving the zmq-proxy (port 10001) |
-| `REPLACE_PREFILL_MASTER_IP` / `_CHILD_IP` | prefill pod IPs (= node mgmt IPs)        |
-| `REPLACE_DECODE_MASTER_IP` / `_CHILD_IP`  | decode pod IPs (= node mgmt IPs)         |
-| `REPLACE_MODEL_HOST_PATH`         | node-local dir holding the DSV3 weights          |
-| `REPLACE_CACHE_HOST_PATH`         | node-local base dir for per-role vLLM cache (suffixed `/prefill`, `/decode`, ...) |
+```go
+// Current (dormant):
+MoRIIOFeatureEnabled = false
 
-The RDMA fabric env in `patch-nccl-env.yaml` (mlx5 device lists, GID
-index, RoCE TC/SL) is also fabric-specific; adjust it for your topology.
+// Future (enabled):
+MoRIIOFeatureEnabled = true
+```
 
-## Deploy
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     2P2D Wide-EP-16 Topology                    │
+├─────────────────────────────────────────────────────────────────┤
+│  PREFILL SIDE                      DECODE SIDE                  │
+│  ┌───────────────┐                 ┌───────────────┐            │
+│  │ prefill-master│ ──MoRI-IO──▶   │ decode-master │◀── sidecar │
+│  │ ranks 0..7    │  RDMA Write     │ ranks 0..7    │            │
+│  └───────┬───────┘                 └───────┬───────┘            │
+│          │ DP coord                        │ DP coord           │
+│  ┌───────▼───────┐                 ┌───────▼───────┐            │
+│  │ prefill-child │ ──MoRI-IO──▶   │ decode-child  │            │
+│  │ ranks 8..15   │  RDMA Write     │ ranks 8..15   │            │
+│  └───────────────┘                 └───────────────┘            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `kustomization.yaml` | Inherits from `../moriio`, applies all patches |
+| `moriio-config.yaml` | **ConfigMap with all placeholders** (edit this!) |
+| `children.yaml` | Child deployments for ranks 8..15 |
+| `patch-*-master.yaml` | Widen masters from DP=8 → DP=16 |
+| `patch-sidecar-2p2d.yaml` | Sidecar multi-pod fan-out |
+| `patch-nccl-env.yaml` | RDMA fabric configuration |
+| `patch-strategy-recreate.yaml` | Prevents rolling update wedge |
+| `inductor-shim-configmap.yaml` | PyTorch inductor workaround |
+
+## Configuration
+
+All deployment-specific values are centralized in `moriio-config.yaml`.
+Edit the `REPLACE_*` placeholders before deploying:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moriio-2p2d-config
+data:
+  # Pod IPs
+  ZMQ_PROXY_HOST: "REPLACE_ZMQ_PROXY_IP"
+  PREFILL_MASTER_HOST: "REPLACE_PREFILL_MASTER_IP"
+  PREFILL_CHILD_HOST: "REPLACE_PREFILL_CHILD_IP"
+  DECODE_MASTER_HOST: "REPLACE_DECODE_MASTER_IP"
+  DECODE_CHILD_HOST: "REPLACE_DECODE_CHILD_IP"
+
+  # RDMA Fabric (cluster-specific)
+  FABRIC_SOCKET_IFNAME: "REPLACE_SOCKET_IFNAME"
+  FABRIC_IB_GID_INDEX: "REPLACE_IB_GID_INDEX"
+  FABRIC_NCCL_IB_HCA: "REPLACE_NCCL_IB_HCA"
+  FABRIC_MORI_RDMA_DEVICES: "REPLACE_MORI_RDMA_DEVICES"
+  FABRIC_UCX_NET_DEVICES: "REPLACE_UCX_NET_DEVICES"
+  FABRIC_RDMA_TC: "REPLACE_RDMA_TC"
+  FABRIC_RDMA_SL: "REPLACE_RDMA_SL"
+```
+
+## Deploy (when enabled)
 
 ```bash
-# 1) Resolve node hostnames and InternalIPs:
-kubectl get nodes -o wide
+# 1) Set images
+cd guides/pd-disaggregation/modelserver/amd/vllm/moriio-2p2d
+kustomize edit set image \
+  REPLACE_MODEL_SERVER_IMAGE=<your-vllm-moriio-rocm-image> \
+  REPLACE_ROUTING_SIDECAR_IMAGE=<your-sidecar-image>
 
-# 2) Replace the REPLACE_* placeholders in the YAML files (sed/envsubst).
+# 2) Edit moriio-config.yaml with your cluster values
 
-# 3) Build and apply:
+# 3) Build and apply
 kubectl kustomize . | kubectl -n llm-d apply -f -
 
-# 4) Wait for the 4 model-server pods + decode-master sidecar to be Ready:
+# 4) Watch pods come up
 kubectl -n llm-d get pods -w
 ```
 
-## Coexistence with the 1P1D overlay
+## Related
 
-The two overlays share zero Kubernetes objects: different Deployment
-names (2P2D adds `*-prefill-child` / `*-decode-child`), different images,
-different node pinning, and different DP coordinator ports. The 1P1D base
-(`../moriio`) is inherited unchanged.
+- [Sidecar MoRI-IO README](https://github.com/llm-d/llm-d-inference-scheduler/blob/main/pkg/sidecar/proxy/MORIIO_README.md)
+- [1P1D Base Guide](../moriio/README.md)
+
+## Contact
+
+For questions about this feature or its timeline, please contact:
+- AMD team
+- llm-d maintainers

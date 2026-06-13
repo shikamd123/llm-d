@@ -1,49 +1,40 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Target the llm-d namespace explicitly; otherwise `kubectl apply -k`
-# defaults to the `default` namespace and creates a second, idle copy.
+# 2P2D Wide-EP-16: DP=EP=16, TP=1 across 2 prefill + 2 decode pods.
+#
+# STATUS: EXPERIMENTAL
+# The MoRI-IO WRITE-mode feature in the sidecar is dormant. This guide
+# can be used for development and testing but requires enabling the
+# feature flag in llm-d-inference-scheduler before production use.
+#
+# Inherits from the 1P1D moriio/ base (DP=EP=8) and extends it to
+# multi-pod topology with:
+#   1. Child deployments (prefill-child, decode-child) for ranks 8..15
+#   2. Master patches for DP=16 with cross-pod coordinator
+#   3. Sidecar patches for multi-pod fan-out
+#   4. ConfigMap for centralized endpoint configuration
+#   5. NCCL/fabric env for cross-pod RDMA
+#   6. Recreate strategy (prevents rolling update wedge)
+
 namespace: llm-d
 
-# 2P2D Wide-EP-16 overlay: DeepSeek-V3 with global DP=EP=16, TP=1 across
-# 2 prefill + 2 decode pods (8 local DP ranks each). Additive to the 1P1D
-# DP=EP=8 base in ../moriio: it inherits that base, patches the master
-# Deployments to DP=16 / dp_local=8 with the cross-pod DP coordinator, and
-# adds the prefill/decode child Deployments for the second 8-rank pod.
-#
-# The sidecar emits remote_hosts + remote_dp_size_local on both legs so
-# vLLM resolves the per-rank pod as pod_idx = global_dp_rank // dp_local
-# and host = remote_hosts[pod_idx].
-#
-# Replace every REPLACE_* placeholder (node names, pod IPs, images) before
-# deploying. See README.md.
-
 resources:
-  # The MoRI-IO zmq registration proxy is provided by the inherited base
-  # overlay and shared by both legs (reached via REPLACE_ZMQ_PROXY_IP).
   - ../moriio
-  - prefill-child.yaml
-  - decode-child.yaml
-  # sitecustomize shim that disables torch._inductor autotune_pointwise
-  # before vLLM imports torch._inductor. The equivalent env var is not
-  # bound in this PyTorch build, so the Python config flag is the only
-  # lever; see inductor-shim-configmap.yaml.
+  - moriio-config.yaml
   - inductor-shim-configmap.yaml
+  - children.yaml
 
-# Supply the MoRI-IO WRITE-mode model-server and Wide-EP multi-pod sidecar
-# images. Re-emitted here (not only in the base) because kustomize image
-# substitution does not cascade onto the child Deployments added above.
-images:
-  - name: REPLACE_MODEL_SERVER_IMAGE
-    newName: REPLACE_MODEL_SERVER_IMAGE_NAME
-    newTag: REPLACE_MODEL_SERVER_IMAGE_TAG
-  - name: REPLACE_ROUTING_SIDECAR_IMAGE
-    newName: REPLACE_ROUTING_SIDECAR_IMAGE_NAME
-    newTag: REPLACE_ROUTING_SIDECAR_IMAGE_TAG
+labels:
+  - pairs:
+      llm-d.ai/topology: 2p2d
+      llm-d.ai/dp-size: "16"
+      llm-d.ai/status: experimental
+    includeSelectors: false
+    includeTemplates: true
 
 patches:
-  # Master Deployments: widen the inherited DP=8 to DP=16 / dp_local=8 and
-  # add the master-side cross-pod DP coordinator args.
+  # Master pod patches: DP=8 → DP=16
   - path: patch-prefill-master.yaml
     target:
       kind: Deployment
@@ -52,14 +43,12 @@ patches:
     target:
       kind: Deployment
       name: pd-disaggregation-rocm-moriio-vllm-decode
-  # Decode sidecar: add --moriio-remote-hosts / --moriio-dp-size-local and
-  # widen --moriio-dp-size for the multi-pod fan-out.
+  # Sidecar multi-pod fan-out configuration
   - path: patch-sidecar-2p2d.yaml
     target:
       kind: Deployment
       name: pd-disaggregation-rocm-moriio-vllm-decode
-  # NCCL/RCCL/MoRI fabric env on all 4 model-server pods so the cross-pod
-  # DP=16 process group can form.
+  # NCCL/RCCL/MoRI fabric env on all 4 model-server pods
   - path: patch-nccl-env.yaml
     target:
       kind: Deployment
@@ -76,8 +65,7 @@ patches:
     target:
       kind: Deployment
       name: pd-disaggregation-rocm-moriio-vllm-decode-child
-  # Recreate strategy on all 4 model-server pods: replicas=1 + hostNetwork
-  # + a pinned nodeSelector make the default RollingUpdate wedge.
+  # Recreate strategy on all 4 model-server pods
   - path: patch-strategy-recreate.yaml
     target:
       kind: Deployment

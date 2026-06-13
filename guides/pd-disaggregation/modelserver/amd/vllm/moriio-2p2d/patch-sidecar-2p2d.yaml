@@ -1,19 +1,16 @@
-# Decode-side routing-sidecar patch for the 2P2D Wide-EP-16 topology.
+# Decode sidecar: multi-pod fan-out flags for 2P2D.
 #
-# A strategic-merge of `args` replaces the whole list, so the parent
-# overlay's flags are re-emitted verbatim plus the multi-pod flags:
-#   --moriio-dp-size=16       global DP world (was 8 in 1P1D)
-#   --moriio-dp-size-local=8  per-pod DP; consumer maps pod_idx = rank/8
-#   --moriio-remote-hosts     ordered prefill pod IPs (master, child)
-#   --moriio-decode-hosts     ordered decode pod IPs (master, child); used
-#                             on the prefill leg so KV is written to the
-#                             right decode pod. Omitting it collapses the
-#                             prefill leg to one host and cross-pod writes
-#                             hang.
+# STATUS: EXPERIMENTAL (requires MoRIIOFeatureEnabled=true in sidecar)
 #
-# The image override in kustomization.yaml supplies a sidecar build that
-# understands these flags. Replace the REPLACE_*_IP placeholders with the
-# pod IPs (= node mgmt IPs under hostNetwork=true) before deploying.
+# Changes from the inherited moriio/ sidecar:
+#   - --moriio-dp-size: 8 → 16
+#   - --moriio-dp-size-local=8
+#   - --moriio-remote-hosts (prefill pod IPs from ConfigMap)
+#   - --moriio-decode-hosts (decode pod IPs from ConfigMap)
+#
+# The sidecar routes requests to the correct DP rank's pod using:
+#   pod_idx = global_dp_rank // dp_size_local
+#   host = remote_hosts[pod_idx]
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,8 +20,6 @@ spec:
     spec:
       initContainers:
         - name: routing-proxy
-          image: REPLACE_ROUTING_SIDECAR_IMAGE
-          imagePullPolicy: IfNotPresent
           args:
             - --port=8000
             - --vllm-port=8200
@@ -35,21 +30,15 @@ spec:
             - --moriio-dp-size=16
             - --moriio-dp-size-local=8
             - --moriio-tp-size=1
-            - --moriio-remote-hosts=REPLACE_PREFILL_MASTER_IP,REPLACE_PREFILL_CHILD_IP
-            - --moriio-decode-hosts=REPLACE_DECODE_MASTER_IP,REPLACE_DECODE_CHILD_IP
+            - --moriio-remote-hosts=$(PREFILL_MASTER_HOST),$(PREFILL_CHILD_HOST)
+            - --moriio-decode-hosts=$(DECODE_MASTER_HOST),$(DECODE_CHILD_HOST)
             - --moriio-parallel-dispatch
             - --moriio-local-pod-ip=$(POD_IP)
+          envFrom:
+            - configMapRef:
+                name: moriio-2p2d-config
           env:
             - name: POD_IP
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
-          ports:
-            - containerPort: 8000
-              name: sidecar
-              protocol: TCP
-          resources: {}
-          restartPolicy: Always
-          securityContext:
-            allowPrivilegeEscalation: false
-            runAsNonRoot: true

@@ -1,0 +1,65 @@
+# MoRI-IO 2P2D Configuration ConfigMap
+#
+# This ConfigMap centralizes all deployment-specific values that operators
+# must configure before deploying. Replace the placeholder values below
+# with your actual cluster configuration.
+#
+# STATUS: EXPERIMENTAL (MoRI-IO feature is dormant in the sidecar)
+#
+# Usage:
+#   1. Copy this file and edit the values for your environment
+#   2. OR use `kubectl create configmap` with --from-literal flags
+#   3. OR override in a per-cluster overlay (overlays/your-cluster/)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moriio-2p2d-config
+  labels:
+    llm-d.ai/config-type: moriio-endpoints
+data:
+  # ===================
+  # Pod IP Configuration
+  # ===================
+  # ZMQ Registration Proxy IP (from moriio-zmq-proxy deployment)
+  ZMQ_PROXY_HOST: "REPLACE_ZMQ_PROXY_IP"
+
+  # Prefill Pod IPs (for decode sidecar fan-out)
+  PREFILL_MASTER_HOST: "REPLACE_PREFILL_MASTER_IP"
+  PREFILL_CHILD_HOST: "REPLACE_PREFILL_CHILD_IP"
+
+  # Decode Pod IPs (for prefill sidecar fan-out)
+  DECODE_MASTER_HOST: "REPLACE_DECODE_MASTER_IP"
+  DECODE_CHILD_HOST: "REPLACE_DECODE_CHILD_IP"
+
+  # ===================
+  # Data Parallel Config
+  # ===================
+  DP_SIZE: "16"
+  DP_SIZE_LOCAL: "8"
+  TP_SIZE: "1"
+
+  # ===================
+  # RDMA Fabric Config
+  # ===================
+  # Network interface for NCCL/GLOO/MoRI socket communication
+  FABRIC_SOCKET_IFNAME: "REPLACE_SOCKET_IFNAME"
+
+  # InfiniBand GID index for RoCE
+  FABRIC_IB_GID_INDEX: "REPLACE_IB_GID_INDEX"
+
+  # NCCL IB HCA filter (prefix with ^ to exclude)
+  # Example: "^mlx5_1,mlx5_6" excludes mlx5_1 and mlx5_6
+  FABRIC_NCCL_IB_HCA: "REPLACE_NCCL_IB_HCA"
+
+  # MoRI RDMA devices (comma-separated mlx5 device names)
+  # Example: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+  FABRIC_MORI_RDMA_DEVICES: "REPLACE_MORI_RDMA_DEVICES"
+
+  # UCX net devices with port (comma-separated device:port pairs)
+  # Example: "mlx5_0:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_7:1,mlx5_8:1,mlx5_9:1"
+  FABRIC_UCX_NET_DEVICES: "REPLACE_UCX_NET_DEVICES"
+
+  # RoCE QoS: Traffic Class (DSCP) and Service Level
+  FABRIC_RDMA_TC: "REPLACE_RDMA_TC"
+  FABRIC_RDMA_SL: "REPLACE_RDMA_SL"

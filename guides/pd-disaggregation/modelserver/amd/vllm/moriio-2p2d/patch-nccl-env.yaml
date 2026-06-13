@@ -5,9 +5,8 @@
 # N] HIP error: no error" tear-down), HCA selection is wrong, and the
 # MoRI-EP shmem / UCX KV handshake never bootstraps.
 #
-# The mlx5 device lists and GID/TC/SL values are fabric-specific; tune
-# them for your RoCE topology (here mlx5_1 and mlx5_6 are mgmt/storage and
-# are excluded).
+# FABRIC CONFIG: The NIC/device values below are PLACEHOLDERS.
+# Replace them for your RoCE topology before deploying.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,12 +16,15 @@ spec:
     spec:
       containers:
         - name: modelserver
+          envFrom:
+            - configMapRef:
+                name: moriio-2p2d-config
           env:
             # NCCL / RCCL multi-pod DP rendezvous over RoCEv2.
-            - { name: GLOO_SOCKET_IFNAME,             value: "eth0" }
-            - { name: NCCL_SOCKET_IFNAME,             value: "eth0" }
-            - { name: NCCL_IB_HCA,                    value: "^mlx5_1,mlx5_6" }
-            - { name: NCCL_IB_GID_INDEX,              value: "1" }
+            - { name: GLOO_SOCKET_IFNAME,             value: "$(FABRIC_SOCKET_IFNAME)" }
+            - { name: NCCL_SOCKET_IFNAME,             value: "$(FABRIC_SOCKET_IFNAME)" }
+            - { name: NCCL_IB_HCA,                    value: "$(FABRIC_NCCL_IB_HCA)" }
+            - { name: NCCL_IB_GID_INDEX,              value: "$(FABRIC_IB_GID_INDEX)" }
             - { name: NCCL_NET_GDR_LEVEL,             value: "3" }
             - { name: NCCL_CROSS_NIC,                 value: "1" }
             # Extend the watchdog heartbeat to cover the long cold start.
@@ -30,13 +32,13 @@ spec:
             - { name: TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC, value: "1800" }
             # MoRI-EP / MoRI-IO fabric: expert-parallel all2all + KV WRITE.
             - { name: MORI_GPU_ARCHS,                 value: "gfx942" }
-            - { name: MORI_RDMA_DEVICES,              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9" }
-            - { name: MORI_SOCKET_IFNAME,             value: "eth0" }
-            - { name: MORI_IB_GID_INDEX,              value: "1" }
+            - { name: MORI_RDMA_DEVICES,              value: "$(FABRIC_MORI_RDMA_DEVICES)" }
+            - { name: MORI_SOCKET_IFNAME,             value: "$(FABRIC_SOCKET_IFNAME)" }
+            - { name: MORI_IB_GID_INDEX,              value: "$(FABRIC_IB_GID_INDEX)" }
             - { name: MORI_NUM_QP_PER_PE,             value: "4" }
             # RoCE QoS: DSCP from MORI_RDMA_TC, eth_prio from MORI_RDMA_SL.
-            - { name: MORI_RDMA_TC,                   value: "41" }
-            - { name: MORI_RDMA_SL,                   value: "0" }
+            - { name: MORI_RDMA_TC,                   value: "$(FABRIC_RDMA_TC)" }
+            - { name: MORI_RDMA_SL,                   value: "$(FABRIC_RDMA_SL)" }
             # MoRI shmem heap per rank (16 GiB); the 4 GiB default fragments
             # and exhausts during MoRI-EP bootstrap at DP=16 EP=16 on DSV3.
             - { name: MORI_SHMEM_HEAP_SIZE,           value: "17179869184" }
@@ -53,8 +55,8 @@ spec:
             # default and trips the coordinator's HELLO guard.
             - { name: VLLM_HANDSHAKE_TIMEOUT_MINS,    value: "120" }
             # UCX transport for the per-request KV handshake.
-            - { name: UCX_NET_DEVICES,                value: "mlx5_0:1,mlx5_2:1,mlx5_3:1,mlx5_4:1,mlx5_5:1,mlx5_7:1,mlx5_8:1,mlx5_9:1" }
-            - { name: UCX_IB_GID_INDEX,               value: "1" }
+            - { name: UCX_NET_DEVICES,                value: "$(FABRIC_UCX_NET_DEVICES)" }
+            - { name: UCX_IB_GID_INDEX,               value: "$(FABRIC_IB_GID_INDEX)" }
             - { name: UCX_TLS,                        value: "rc,self,shm,tcp" }
             - { name: UCX_IB_GPU_DIRECT_RDMA,         value: "y" }
             # ROCm / HIP runtime tweaks.

@@ -1,0 +1,319 @@
+# Child Deployments for 2P2D Wide-EP-16 topology.
+#
+# These deployments run DP ranks 8..15 (the second pod on each side).
+# They join the master's DP coordinator in --headless mode (no OAI front-end).
+#
+# STATUS: EXPERIMENTAL (MoRI-IO feature is dormant in the sidecar)
+#
+# Key differences from master pods:
+#   - --data-parallel-start-rank=8 (ranks 8..15 instead of 0..7)
+#   - --headless (no HTTP API, workers only)
+#   - Connects to master's --data-parallel-address instead of hosting coordinator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-disaggregation-rocm-moriio-vllm-prefill-child
+  labels:
+    llm-d.ai/role: prefill-child
+    llm-d.ai/topology: 2p2d
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-disaggregation-rocm-moriio-vllm-prefill-child
+  template:
+    metadata:
+      labels:
+        app: pd-disaggregation-rocm-moriio-vllm-prefill-child
+        llm-d.ai/role: prefill-child
+        llm-d.ai/inference-serving: "true"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: modelserver
+          image: REPLACE_MODEL_SERVER_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - "deepseek-ai/DeepSeek-V3"
+            - "--served-model-name=deepseek-ai/DeepSeek-V3"
+            - "--disable-uvicorn-access-log"
+            - "--tensor-parallel-size=1"
+            - "--gpu-memory-utilization=0.75"
+            - "--kv-cache-memory-bytes=20000000000"
+            - "--data-parallel-size=16"
+            - "--data-parallel-size-local=8"
+            - "--data-parallel-address=$(PREFILL_MASTER_HOST)"
+            - "--data-parallel-rpc-port=13345"
+            - "--data-parallel-start-rank=8"
+            - "--headless"
+            - "--enable-expert-parallel"
+            - "--all2all-backend=mori_high_throughput"
+            - "--block-size=16"
+            - "--no-enable-prefix-caching"
+            - "--max-model-len=32768"
+            - "--compilation-config"
+            - '{"cudagraph_mode":"NONE"}'
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MoRIIOConnector","kv_role":"kv_producer","kv_connector_extra_config":{"proxy_ip":"$(ZMQ_PROXY_HOST)","proxy_ping_port":"10001","http_port":"8000","handshake_port":"6301","notify_port":"61005"}}'
+          envFrom:
+            - configMapRef:
+                name: moriio-2p2d-config
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            # Inductor shim: prepend sitecustomize.py to PYTHONPATH
+            - name: PYTHONPATH
+              value: "/opt/inductor-shim"
+            - name: VLLM_MORIIO_CONNECTOR_READ_MODE
+              value: "0"
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "7200"
+            - name: VLLM_ROCM_USE_AITER
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_MOE
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_PAGED_ATTN
+              value: "0"
+            - name: VLLM_ROCM_USE_AITER_RMSNORM
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_MLA
+              value: "0"
+            - name: HSA_ENABLE_SDMA
+              value: "1"
+            - name: HSA_FORCE_FINE_GRAIN_PCIE
+              value: "1"
+            - name: MORI_SHMEM_HEAP_SIZE
+              value: "17179869184"
+          ports:
+            - containerPort: 6301
+              name: mori-handshake
+            - containerPort: 61005
+              name: mori-notify
+          resources:
+            limits:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+            requests:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK", "SYS_PTRACE", "NET_RAW"]
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: cache
+            - mountPath: /dev/kfd
+              name: dev-kfd
+            - mountPath: /dev/dri
+              name: dev-dri
+            - mountPath: /dev/infiniband
+              name: dev-ib
+            - mountPath: /opt/inductor-shim
+              name: inductor-shim
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: 6301
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 240
+          livenessProbe:
+            tcpSocket:
+              port: 6301
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: cache
+          emptyDir: {}
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+        - name: dev-ib
+          hostPath:
+            path: /dev/infiniband
+        - name: inductor-shim
+          configMap:
+            name: inductor-autotune-shim
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-disaggregation-rocm-moriio-vllm-decode-child
+  labels:
+    llm-d.ai/role: decode-child
+    llm-d.ai/topology: 2p2d
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-disaggregation-rocm-moriio-vllm-decode-child
+  template:
+    metadata:
+      labels:
+        app: pd-disaggregation-rocm-moriio-vllm-decode-child
+        llm-d.ai/role: decode-child
+        llm-d.ai/inference-serving: "true"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: modelserver
+          image: REPLACE_MODEL_SERVER_IMAGE
+          imagePullPolicy: IfNotPresent
+          command: ["vllm", "serve"]
+          args:
+            - "deepseek-ai/DeepSeek-V3"
+            - "--served-model-name=deepseek-ai/DeepSeek-V3"
+            - "--disable-uvicorn-access-log"
+            - "--tensor-parallel-size=1"
+            - "--gpu-memory-utilization=0.75"
+            - "--kv-cache-memory-bytes=20000000000"
+            - "--data-parallel-size=16"
+            - "--data-parallel-size-local=8"
+            - "--data-parallel-address=$(DECODE_MASTER_HOST)"
+            - "--data-parallel-rpc-port=13346"
+            - "--data-parallel-start-rank=8"
+            - "--headless"
+            - "--enable-expert-parallel"
+            - "--all2all-backend=mori_low_latency"
+            - "--block-size=16"
+            - "--no-enable-prefix-caching"
+            - "--max-model-len=32768"
+            - "--compilation-config"
+            - '{"cudagraph_mode":"NONE"}'
+            - "--kv-transfer-config"
+            - '{"kv_connector":"MoRIIOConnector","kv_role":"kv_consumer","kv_connector_extra_config":{"proxy_ip":"$(ZMQ_PROXY_HOST)","proxy_ping_port":"10001","http_port":"8000","handshake_port":"6301","notify_port":"61005"}}'
+          envFrom:
+            - configMapRef:
+                name: moriio-2p2d-config
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
+            # Inductor shim: prepend sitecustomize.py to PYTHONPATH
+            - name: PYTHONPATH
+              value: "/opt/inductor-shim"
+            - name: VLLM_MORIIO_CONNECTOR_READ_MODE
+              value: "0"
+            - name: VLLM_ENGINE_READY_TIMEOUT_S
+              value: "7200"
+            - name: VLLM_ROCM_USE_AITER
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_MOE
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_PAGED_ATTN
+              value: "0"
+            - name: VLLM_ROCM_USE_AITER_RMSNORM
+              value: "1"
+            - name: VLLM_ROCM_USE_AITER_MLA
+              value: "0"
+            - name: HSA_ENABLE_SDMA
+              value: "1"
+            - name: HSA_FORCE_FINE_GRAIN_PCIE
+              value: "1"
+            - name: MORI_SHMEM_HEAP_SIZE
+              value: "17179869184"
+          ports:
+            - containerPort: 6301
+              name: mori-handshake
+            - containerPort: 61005
+              name: mori-notify
+          resources:
+            limits:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+            requests:
+              cpu: "200"
+              memory: 1500Gi
+              amd.com/gpu: "8"
+              rdma/ib: "1"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["IPC_LOCK", "SYS_PTRACE", "NET_RAW"]
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: shm
+            - mountPath: /.cache
+              name: cache
+            - mountPath: /dev/kfd
+              name: dev-kfd
+            - mountPath: /dev/dri
+              name: dev-dri
+            - mountPath: /dev/infiniband
+              name: dev-ib
+            - mountPath: /opt/inductor-shim
+              name: inductor-shim
+              readOnly: true
+          startupProbe:
+            tcpSocket:
+              port: 6301
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 240
+          livenessProbe:
+            tcpSocket:
+              port: 6301
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+        - name: cache
+          emptyDir: {}
+        - name: dev-kfd
+          hostPath:
+            path: /dev/kfd
+        - name: dev-dri
+          hostPath:
+            path: /dev/dri
+        - name: dev-ib
+          hostPath:
+            path: /dev/infiniband
+        - name: inductor-shim
+          configMap:
+            name: inductor-autotune-shim
