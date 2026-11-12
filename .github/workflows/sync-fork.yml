@@ -1,0 +1,83 @@
+name: Sync fork with upstream
+
+# Keeps shikamd123/llm-d main on llm-d/llm-d main. This file is the only
+# commit that should exist on the fork and not on upstream. The job
+# refuses to rewrite main when any other fork-only commit is present.
+on:
+  schedule:
+    # 16:15 UTC daily (08:15 America/Los_Angeles). GitHub may delay scheduled runs.
+    - cron: "15 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Replay the sync commit onto upstream main
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/llm-d/llm-d.git
+          git fetch upstream main
+          git fetch origin main
+
+          expected=$(git rev-parse refs/remotes/origin/main)
+          git checkout -B main "$expected"
+
+          workflow_path=".github/workflows/sync-fork.yml"
+          if [ ! -f "$workflow_path" ]; then
+            echo "Missing ${workflow_path} on fork main; refusing to sync."
+            exit 1
+          fi
+
+          while read -r commit; do
+            [ -z "$commit" ] && continue
+            files=$(git diff-tree --no-commit-id --name-only -r "$commit")
+            if [ "$files" != "$workflow_path" ]; then
+              echo "Refusing to sync. Fork main has commit ${commit} outside ${workflow_path}:"
+              printf '%s\n' "$files"
+              exit 1
+            fi
+          done < <(git rev-list upstream/main..HEAD)
+
+          ahead=$(git rev-list --count upstream/main..HEAD)
+          if git merge-base --is-ancestor upstream/main HEAD && [ "$ahead" -eq 1 ]; then
+            echo "Fork main already matches upstream, plus the sync workflow commit."
+            exit 0
+          fi
+
+          tmp=$(mktemp)
+          cp "$workflow_path" "$tmp"
+          git reset --hard upstream/main
+
+          if git cat-file -e "upstream/main:${workflow_path}" 2>/dev/null; then
+            if cmp -s "$tmp" <(git show "upstream/main:${workflow_path}"); then
+              echo "Upstream already contains this workflow. Moving fork main onto upstream."
+              git push --force-with-lease="refs/heads/main:${expected}" origin HEAD:main
+              exit 0
+            fi
+            echo "Upstream has a different ${workflow_path}. Refusing to overwrite it."
+            exit 1
+          fi
+
+          mkdir -p .github/workflows
+          cp "$tmp" "$workflow_path"
+          git add "$workflow_path"
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "ci: keep this fork's main synced with llm-d/llm-d [skip ci]"
+          git push --force-with-lease="refs/heads/main:${expected}" origin HEAD:main
